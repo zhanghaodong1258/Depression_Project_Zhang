@@ -1,2 +1,2 @@
 # Depression_Project_Zhang
-Depression Project fo Zhang et al.
+Depression Project of Zhang et al.
