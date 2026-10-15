@@ -11,9 +11,11 @@ optimization (04-2) into one pipeline:
      directories (config.ML_OUTPUT_DIR, config.DL_OUTPUT_DIR,
      config.LIGHTWEIGHT_OUTPUT_DIR).
   2. Build candidate ensembles:
-       * Average (uniform weights)
-       * Weighted average
-       * Optimized federated weighted average 
+       * Aaverage (uniform weights)
+       * F1-weighted average: weights assigned by each model's average F1
+         score on the validation split, positively correlated with
+         performance (higher F1 -> higher weight)
+       * Optimized F1-weighted average (grid-searched weight shaping)
   3. Grid-search the weighted-average hyper-parameters on the train split
      (weight_exponent, weight_threshold, normalize_weights, clip_weights,
      base_metric) and select the best configuration per ensemble combination.
@@ -69,12 +71,14 @@ DATA_DIR_CATEGORY = [
 ]
 
 # Coarse grid for the full-combination search; a finer grid can be enabled below.
+# base_metric defaults to "F1" so that weights are positively correlated with
+# each model's average F1 on the validation split.
 TUNING_GRID = {
-    "weight_exponent": [0.1, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0],
-    "weight_threshold": [0.0, 0.3, 0.5, 0.6, 0.7, 0.8, 0.9],
-    "normalize_weights": [True, False],
-    "clip_weights": [None, (0.1, 10.0), (0.5, 2.0), (0.8, 1.2)],
-    "base_metric": ["AUC", "F1", "Accuracy"],
+    "weight_exponent": [0.5, 1.0, 1.5, 2.0, 3.0],
+    "weight_threshold": [0.0, 0.3, 0.5, 0.7],
+    "normalize_weights": [True],
+    "clip_weights": [None, (0.5, 2.0)],
+    "base_metric": ["F1", "AUC", "Accuracy"],
 }
 
 
@@ -166,7 +170,7 @@ def federated_weighted(predictions_list, weights,
     Parameters
     ----------
     predictions_list : list[np.ndarray]
-    weights : list[float]          Base weight per model.
+    weights : list[float]          Base weight per model (e.g. per-model AUC).
     weight_exponent : float         Power applied to each base weight.
     weight_threshold : float        Models with shaped weight below this drop out.
     normalize_weights : bool        Divide shaped weights by their sum.
@@ -201,9 +205,83 @@ def _base_weight(y_true, y_prob, metric="AUC"):
     return 0.5
 
 
-def build_ensemble_table(all_data, algorithm_info, dataset=None):
+def compute_f1_weights(all_data, model_names):
+    """
+    Compute per-model ensemble weights from the average F1 score across all
+    time points on the validation (train) split.
+
+    Weights are positively correlated with model performance:
+        weight_i = avg_F1_i / sum_j(avg_F1_j)
+
+    Models with higher average F1 receive proportionally higher weights,
+    maximizing the complementary advantages of diverse base models.
+
+    Parameters
+    ----------
+    all_data : dict {model_name: DataFrame}
+    model_names : list[str]
+        Subset of models to include.
+
+    Returns
+    -------
+    weights : dict {model_name: float}
+        Normalized weights summing to 1.
+    avg_f1 : dict {model_name: float}
+        Raw average F1 scores (before normalization).
+    """
+    train_data = {}
+    for name, df in all_data.items():
+        if "Dataset" in df.columns:
+            sub = df[df["Dataset"] == "Train"].copy()
+            if not sub.empty:
+                train_data[name] = sub
+
+    avg_f1 = {}
+    for model in model_names:
+        if model not in train_data:
+            avg_f1[model] = 0.0
+            continue
+        d = train_data[model]
+        f1s = []
+        for t in CFG.TIME_POINTS:
+            a_col, p_col = f"Actual_{t}y", f"Pred_{t}y"
+            if a_col not in d.columns or p_col not in d.columns:
+                continue
+            valid = d.dropna(subset=[a_col, p_col])
+            if valid.empty:
+                continue
+            y_true = valid[a_col].values.astype(int)
+            if len(np.unique(y_true)) < 2:
+                continue
+            y_pred = (valid[p_col].values >= 0.5).astype(int)
+            f1s.append(f1_score(y_true, y_pred, zero_division=0))
+        avg_f1[model] = float(np.mean(f1s)) if f1s else 0.0
+
+    # Normalize: positive correlation with F1, sum to 1.
+    total = sum(avg_f1.values())
+    if total > 0:
+        weights = {m: avg_f1[m] / total for m in model_names}
+    else:
+        n = len(model_names)
+        weights = {m: 1.0 / n for m in model_names} if n > 0 else {}
+    return weights, avg_f1
+
+
+def build_ensemble_table(all_data, algorithm_info, f1_weights=None, dataset=None):
     """
     Generate ensemble predictions in the same long format as single models.
+
+    Strategies:
+      - FedAvg:     uniform-weight average across models.
+      - F1Weighted: weighted average using pre-computed per-model average F1
+                    scores on the validation split. Weights are positively
+                    correlated with performance (higher F1 -> higher weight).
+
+    Parameters
+    ----------
+    f1_weights : dict {model_name: float} | None
+        Pre-computed normalized F1-based weights. If None, falls back to
+        per-time-point AUC weights for backward compatibility.
 
     Returns a DataFrame with columns: ID, Dataset, Actual_{t}y, Pred_{t}y,
     Algorithm_Category="ensemble", Algorithm_Name="{combo}_{strategy}".
@@ -224,11 +302,23 @@ def build_ensemble_table(all_data, algorithm_info, dataset=None):
         selected = _select_models(combo, algorithm_info, filtered)
         if len(selected) < 1:
             continue
-        for strategy_name, strategy in (("Avg", "average"),
-                                       ("Weighted", "weighted")):
+
+        # Build F1-based weight vector for this combination (fixed across time).
+        if f1_weights is not None:
+            combo_f1_w = [f1_weights.get(m, 0.0) for m in selected]
+            w_sum = sum(combo_f1_w)
+            if w_sum > 0:
+                combo_f1_w = [w / w_sum for w in combo_f1_w]
+            else:
+                combo_f1_w = [1.0 / len(selected)] * len(selected)
+        else:
+            combo_f1_w = None
+
+        for strategy_name, strategy in (("FedAvg", "average"),
+                                       ("F1Weighted", "f1_weighted")):
             for t in CFG.TIME_POINTS:
                 a_col, p_col = f"Actual_{t}y", f"Pred_{t}y"
-                preds, base_w, gt = [], [], None
+                preds, gt = [], None
                 for model in selected:
                     d = filtered[model][filtered[model]["ID"].isin(common)] \
                         .sort_values("ID")
@@ -239,13 +329,21 @@ def build_ensemble_table(all_data, algorithm_info, dataset=None):
                     m = ~np.isnan(y_prob)
                     preds.append(y_prob[m])
                     gt = y_true[m] if gt is None else gt
-                    base_w.append(_base_weight(y_true[m], y_prob[m], "AUC"))
                 if not preds or gt is None:
                     continue
                 if strategy == "average":
                     ens_pred = federated_average(preds)
                 else:
-                    ens_pred = federated_weighted(preds, base_w)
+                    # F1-weighted: use pre-computed average-F1 weights (positive
+                    # correlation with performance). Exponent=1 preserves linear
+                    # proportionality; adjust via TUNING_GRID for sharper focus.
+                    ens_pred = federated_weighted(
+                        preds, combo_f1_w,
+                        weight_exponent=1.0,
+                        weight_threshold=0.0,
+                        normalize_weights=True,
+                        clip_weights=None,
+                    )
                 base = pd.DataFrame({
                     "ID": np.asarray(common)[~np.isnan(gt)][:len(ens_pred)],
                     "Dataset": dataset if dataset else "All",
@@ -483,16 +581,33 @@ def main():
     out_dir = ensure_dir(CFG.ENSEMBLE_OUTPUT_DIR)
     print("=" * 60)
     print("Ensemble modeling and hyper-parameter optimization")
+    print("Weighted strategy: F1-average weights (positive correlation)")
     print("=" * 60)
 
     all_data, algorithm_info = load_all_data()
     if not all_data:
         raise RuntimeError("No model predictions loaded. Run scripts 05-07.")
 
-    # 1. Baseline ensembles (average + AUC-weighted), per dataset and combined.
+    # 0. Compute per-model average F1 weights on the validation (train) split.
+    #    These weights are positively correlated with model performance and are
+    #    reused by both the baseline F1Weighted ensemble and the tuned optimizer.
+    all_model_names = list(all_data.keys())
+    f1_weights, avg_f1 = compute_f1_weights(all_data, all_model_names)
+    f1_weight_df = pd.DataFrame({
+        "Model": all_model_names,
+        "Avg_F1_Validation": [avg_f1[m] for m in all_model_names],
+        "Ensemble_Weight": [f1_weights[m] for m in all_model_names],
+    }).sort_values("Avg_F1_Validation", ascending=False).reset_index(drop=True)
+    f1_weight_df.round(6).to_csv(
+        os.path.join(out_dir, "f1_weight_table.csv"), index=False)
+    print("\nPer-model F1 weights (validation split):")
+    print(f1_weight_df.to_string(index=False))
+
+    # 1. Baseline ensembles (FedAvg + F1Weighted), per dataset and combined.
     ensemble_frames = []
     for dataset in ["Train", "Test", None]:
-        ens = build_ensemble_table(all_data, algorithm_info, dataset=dataset)
+        ens = build_ensemble_table(all_data, algorithm_info,
+                                   f1_weights=f1_weights, dataset=dataset)
         if not ens.empty:
             ensemble_frames.append(ens)
     ensemble_preds = pd.concat(ensemble_frames, ignore_index=True) \
@@ -504,7 +619,7 @@ def main():
     metrics.round(6).to_csv(os.path.join(out_dir, "ensemble_metrics.csv"),
                             index=False)
 
-    # 2. Grid-search hyper-parameters on the train split.
+    # 2. Grid-search hyper-parameters on the train split (base_metric=F1 by default).
     print("\nRunning ensemble weight grid search ...")
     tuning = run_grid_search(all_data, algorithm_info)
     tuning.round(8).to_csv(os.path.join(out_dir, "tuning_results.csv"), index=False)
