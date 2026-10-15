@@ -53,7 +53,7 @@ All paths and parameters live in `config.py`. Key settings:
 - `OUTPUT_ROOT` — all results written under here, one subdirectory per step
 - `ID_COL`, `TIME_COL`, `EVENT_COL` — standard column names (`ID`, `Followup_Time`, `Depression_Event`)
 - `TIME_POINTS` — `[2, 4, 6, 8]` years
-- `TEST_SIZE` — `0.2`, `RANDOM_STATE` — `42`
+- `TEST_SIZE` — `0.3`, `RANDOM_STATE` — `42`
 - `PLOT_DPI` — `300`, `FONT_FAMILY` — `Arial`
 
 ## Dependencies
